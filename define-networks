@@ -1,0 +1,541 @@
+#!/usr/bin/python3
+
+# KNOWN BUGS
+# - can use mac addresses, which dont work for all iface types
+# - duplicate mac addresses are ignored
+# - only eth and tun iface types are tested
+
+import ipaddress
+import argparse
+import queue
+import subprocess
+import re
+import sys
+import os
+from typing import Optional
+
+def eprint(*args, color=None, indents=0, **kwargs):
+    color_codes = {
+        'black': '30',
+        'red': '31',
+        'green': '32',
+        'yellow': '33',
+        'blue': '34',
+        'magenta': '35',
+        'cyan': '36',
+        'white': '37'
+    }
+
+    indent_str = '    ' * indents  # 4 spaces per indent level, adjust as desired
+
+    if color in color_codes:
+        args = ['\033[' + color_codes[color] + 'm' + indent_str + arg + '\033[0m' for arg in args]
+    else:
+        args = [indent_str + arg for arg in args]
+
+    print(*args, file=sys.stderr, **kwargs)
+
+def check_root():
+    if os.geteuid() != 0:
+        exit("You need to have root privileges to run this script.\nPlease try again, this time using 'sudo'. Exiting.")
+
+def is_mac_address(string: str) -> bool:
+    """Check if the string is a valid MAC address"""
+    return re.fullmatch(r"(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}|[0-9a-fA-F]{12}", string) is not None
+
+def get_interface_by_mac(mac_address: str) -> Optional[str]:
+    """Return the network interface corresponding to a given MAC address"""
+    if len(mac_address) == 12:  # If MAC address has no separators
+        # Add colons to MAC address
+        mac_address = ':'.join(mac_address[i:i+2] for i in range(0, 12, 2))
+    
+    result = subprocess.run(['ifconfig', '-a'], capture_output=True, text=True)
+    interfaces = result.stdout.split('\n\n')
+
+    for interface in interfaces:
+        if mac_address in interface:
+            interface_name = re.match(r"^\w+", interface).group()
+            return interface_name.replace('Link', '') if 'Link' in interface_name else interface_name
+
+    return None
+
+def get_network_interface(string: str) -> Optional[str]:
+    """Get the network interface given a MAC address or interface name"""
+    if is_mac_address(string):
+        mac = get_interface_by_mac(string)
+        eprint("converted " + str(string) + " to " + str(mac), indents=1)
+        return mac
+    else:
+        return string
+
+def extract_dhcp_info():
+
+    eprint("Running nmap to extract DHCP info...")
+
+    command = ['nmap', '-T4', '--script', 'broadcast-dhcp-discover']
+
+    # Run the command and get the output
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    # Ensure the command didn't produce an error
+    if result.returncode != 0:
+        raise Exception(f"Command failed with error {result.stderr.decode()}")
+
+    # print(result)
+
+    # Split the output into lines
+    output = result.stdout.decode('utf-8').split('\n')
+
+    servers = []
+
+    # Define regex to match interface, server identifier and subnet mask
+    interface_regex = re.compile(r'^\|\s*Interface:\s*(.*)$')
+    server_regex = re.compile(r'^\|\s*Server Identifier:\s*(.*)$')
+    subnet_regex = re.compile(r'^\|\s*Subnet Mask:\s*(.*)$')
+
+    current_interface = None
+    current_server = None
+
+    for line in output:
+
+        # If the line contains an interface, save it
+        interface_match = interface_regex.match(line)
+        if interface_match:
+            current_interface = interface_match.group(1)
+            # eprint("found interface: " + str(current_interface))
+
+        # If the line contains a server identifier, save it
+        server_match = server_regex.match(line)
+        if server_match:
+            current_server = server_match.group(1)
+            # eprint("found server: " + str(current_server))
+
+        # If the line contains a subnet mask, save it and convert to CIDR
+        subnet_match = subnet_regex.match(line)
+        if subnet_match and current_interface and current_server:
+
+            subnet_mask = subnet_match.group(1)
+            cidr = ipaddress.ip_network(f"0.0.0.0/{subnet_mask}").prefixlen  # Convert subnet mask to CIDR
+            # eprint("found CIDR subnet range: " + str(cidr))
+
+            servers.append((current_interface, f"{current_server}/{cidr}"))
+            current_interface = None
+            current_server = None
+
+            # eprint("--appended new subnet entry--")
+
+    for server in servers:
+        eprint("found server: " + str(server), indents=1)
+
+    return servers
+
+def merge_interface_groups(iface_groups, join_groups):
+
+    eprint("merging interface groups...")
+
+    merged_iface_groups = iface_groups.copy()
+
+    for _join_group in join_groups:
+
+        eprint("join group: " + str(_join_group), indents=1)
+
+        join_group = _join_group.split()
+
+        for i in range(len(join_group)):
+            join_group[i] = get_network_interface(join_group[i])
+
+        indices_to_merge = []
+
+        # Find the indices of the groups that contain interfaces from the join_group
+        for i, group in enumerate(merged_iface_groups):
+            if any(iface in group for iface in join_group):
+                indices_to_merge.append(i)
+
+        # Merge the groups together
+        if indices_to_merge:
+            merged_group = []
+            for index in indices_to_merge:
+                merged_group.extend(merged_iface_groups[index])
+            merged_group = list(set(merged_group))  # remove duplicates
+
+            eprint(f"Merging groups at indices {indices_to_merge} into {merged_group}", indents=1)
+            
+            # Remove the old groups and add the merged group
+            indices_to_merge.sort(reverse=True)
+            for index in indices_to_merge:
+                del merged_iface_groups[index]
+            merged_iface_groups.append(merged_group)
+
+    return merged_iface_groups
+
+def get_iface_groups(iface_types, timelimit):
+
+    eprint("running iface-groups to get interface groups...")
+
+    eprint("given iface types: " + str(iface_types), indents=1)
+    eprint("time limit: " + str(timelimit), indents=1)
+
+    cmd = ['/bin/iface-groups']
+
+    for iface_type in iface_types:
+        cmd.extend(['-i', iface_type])
+
+    cmd.extend(['-t', str(timelimit)])
+
+    output = subprocess.run(cmd, capture_output=True, text=True)
+
+    if output.returncode != 0:
+        eprint('Error running iface-groups')
+        return 1
+
+    interface_groups = []
+    for line in output.stdout.splitlines():
+        interface_group = line.split()
+        interface_groups.append(interface_group)
+        
+        eprint("interface group: " + str(interface_group), indents=1)
+
+    return interface_groups
+
+def assign_discovered_subnets(dhcp_info, iface_groups):
+
+    eprint("assigning discovered subnets...") 
+    
+    assigned_subnets = []
+    
+    for iface_group in iface_groups:
+
+        subnet_found = False
+        
+        for _iface in iface_group:
+
+            # convert MAC to iface
+            iface = get_network_interface(_iface)
+
+            subnet = next((s for i, s in dhcp_info if i == iface), None)
+            
+            if subnet is not None:
+                assigned_subnets.append([iface_group, subnet, 'discovered'])
+                subnet_found = True
+
+                eprint("ASSIGNED: " + str(assigned_subnets[-1]), color='green')
+                break
+        
+        if not subnet_found:
+
+            assigned_subnets.append([iface_group, None, 'none'])
+
+    # assigned_subnet_overlap(assigned_subnets, '192.168.0.0/8')
+    
+    return assigned_subnets
+
+def assigned_subnet_overlap(assigned_subnets, new_subnet):
+
+    eprint("checking if " + str(new_subnet) + " overlaps with existing subnets...", indents=1)
+
+    new_subnet = ipaddress.IPv4Network(str(new_subnet), False)
+
+    # [[['enp0s20f0u3', 'enp0s31f6'], '192.168.1.1/24', 'discovered'], [['eth0'], None, 'none']]
+    for assigned_subnet in assigned_subnets:
+
+        a_subnet = assigned_subnet[1]
+
+        if a_subnet is not None:
+            if new_subnet.overlaps(ipaddress.IPv4Network(str(a_subnet), False)):
+
+                eprint("subnet " + str(new_subnet) + " overlaps existing subnet " + str(a_subnet), indents=2)
+                return False
+
+    return True
+
+def assign_manual_subnets(assigned_subnets, manual_subnets):
+
+    eprint("Manually assigning subnets...")
+    
+    if manual_subnets is None:
+        eprint("No manual subnets provided", indents=1)
+        return
+
+    for _m_iface, m_subnet in manual_subnets:
+
+        m_iface = get_network_interface(_m_iface)
+
+        if m_subnet.isdigit():
+            eprint('manual pair (' + str(m_iface) + ', ' + str(m_subnet) + ') will be used for dynamic generation', indents=1)
+            continue
+
+        # we assign manual subnets in order of precedence
+        if not assigned_subnet_overlap(assigned_subnets, m_subnet):
+            continue
+
+        # [[['enp0s20f0u3', 'enp0s31f6'], '192.168.1.1/24', 'discovered'], [['eth0'], None, 'none']]
+        for index, assigned_subnet in enumerate(assigned_subnets):
+
+            a_group  = assigned_subnet[0]
+            a_subnet = assigned_subnet[1]
+
+            if m_iface in a_group:
+
+                eprint('found ' + str(m_iface) + ' in ' + str(a_group) + ' with subnet ' + str(a_subnet), indents=1)
+
+                if a_subnet is None:
+
+                    eprint("Manually assigning " + str(m_iface) + ' the subnet ' + str(m_subnet), indents=1)
+
+                    assigned_subnets[index][1] = m_subnet
+                    assigned_subnets[index][2] = 'manual'
+
+                    eprint("ASSIGNED: " + str(assigned_subnets[index]), color='green')
+
+                else:
+
+                    eprint("DHCP server already exists, ignoring manual assignment", color='red', indents=1)
+
+                break
+
+def possible_subnets(main, taken):
+
+    # eprint("searching for possible subnets within " + str(main) + "...", indents=2)
+
+    # we assume no subnets are available intially
+    available = []
+    q = queue.Queue()
+
+    # add first node for expansion in the BFS process
+    q.put(main)
+
+    while q.qsize() > 0:
+        subnet = q.get()
+        has_overlap = False
+
+        if taken:
+
+            for taken_subnet in taken:
+
+                if subnet.overlaps(taken_subnet):
+                    # still has overlaps somewhere in children, keep expanding
+
+                    if subnet.prefixlen < 31: # avoid adding /32 and /31 subnets to the queue
+                        for sub_subnet in subnet.subnets():
+                            q.put(sub_subnet)
+                    has_overlap = True
+                    break
+
+            if not has_overlap:
+                # no overlaps with taken - this subnet is entirely available
+                available.append(subnet)
+        else:
+            # if no subnets are taken, all subnets are available
+            available.append(subnet)
+
+    return available
+
+def get_new_subnet(available_subnets, taken_subnets, desired_subnet_size):
+
+    eprint("generating a list of subnets already in use...", indents=1)
+
+    if taken_subnets:
+        for taken_subnet in taken_subnets:
+            eprint("unavailable subnet: " + str(taken_subnet), indents=2)
+    else:
+        eprint("no known subnets are in use", indents=2)
+
+    available_subnets_complete = []
+
+    eprint("generating a sorted list of available subnets, after subtracting unavailable ranges...", indents=1)
+
+    for available_supernet in available_subnets:
+        eprint("candidate supernet: " + str(available_supernet), indents=2)
+
+    for available_subnet in available_subnets:
+        available_subnets_complete.extend(possible_subnets(available_subnet, taken_subnets))
+
+    # now we have an exhaustive list of the known free space
+
+    sorted_subnets = sorted(available_subnets_complete, key=lambda subnet: subnet.prefixlen, reverse=True)
+
+    # find the smallest subnet that fits our needs
+
+    matching_subnet = []
+
+    eprint("searching available subnets for smallest that is at least a /" + str(desired_subnet_size) + " ...", indents=1)
+
+    for subnet in sorted_subnets:
+
+        eprint("candidate subnet: " + str(subnet), indents=2)
+
+        if int(subnet.prefixlen) <= int(desired_subnet_size):
+            matching_subnet = subnet
+            # eprint("subnet is suitable: " + str(subnet))
+            break
+
+    if not matching_subnet:
+        eprint("no matching subnet found", indents=3)
+        return 1
+    else:
+        resized = next(matching_subnet.subnets(new_prefix=int(desired_subnet_size)))
+        eprint("available subnet found: " + str(resized), indents=3)
+        return resized
+
+def assign_dynamic_subnets(assigned_subnets, manual_subnets, subnet_pool, default_subnet_size):
+
+    eprint("dynamically assigning subnets...")
+
+    existing_subnets = [ipaddress.IPv4Network(subnet, False) for _, subnet, _ in assigned_subnets if subnet]
+
+    # Create a dictionary mapping interfaces to preferred subnet sizes for easy lookup
+    preferred_sizes = {}
+
+    manual_subnets = manual_subnets if manual_subnets is not None else []
+
+    for _iface, size in manual_subnets:
+
+        iface = get_network_interface(_iface)
+
+        if size.isdigit():
+            preferred_sizes[iface] = int(size)
+
+    # Iterate over assigned_subnets looking for interface groups without assigned subnets
+    for index, (iface_group, assigned_subnet, method) in enumerate(assigned_subnets):
+
+        if assigned_subnet is not None:
+            continue  # Skip interface groups that already have a subnet assigned
+
+        # Get the preferred subnet size for the first interface in the group that has a preference,
+        # or use the default subnet size if no preference is found
+        subnet_size = default_subnet_size
+        for _iface in iface_group:
+
+            iface = get_network_interface(_iface)
+
+            if iface in preferred_sizes:
+                subnet_size = preferred_sizes[iface]
+                break
+
+        eprint("Finding a /" + str(subnet_size) + " subnet for interface group " + str(iface_group), indents=1)
+
+        # Create a list to hold the generated subnets
+        generated_subnets = []
+
+        # Generate all possible subnets of the required size from the subnet pool
+        for pool_subnet in subnet_pool:
+            pool_subnet = ipaddress.IPv4Network(pool_subnet, False)  # ensure pool_subnet is an IPv4Network object
+            generated_subnets.extend(possible_subnets(pool_subnet, [ipaddress.IPv4Network(s[1], False) for s in assigned_subnets if s[1] is not None]))
+
+        new_subnet = get_new_subnet(generated_subnets, existing_subnets, subnet_size)
+
+        if new_subnet:
+
+            eprint(f"assigning {new_subnet} to {iface_group}", indents=1)
+            existing_subnets.append(new_subnet)
+            assigned_subnets[index][1] = str(new_subnet)
+            assigned_subnets[index][2] = 'dynamic'
+
+            eprint("ASSIGNED: " + str(assigned_subnets[index]), color='green')
+            # continue
+                
+        else:
+            eprint(f"No available subnets for {iface_group}", indents=1)
+
+def find_and_assign_subnets(iface_types, timelimit, subnet_pool, manual_subnets, default_subnet_size, join_groups):
+
+    eprint("Finding and assigning subnets...", color='green')
+    
+    iface_groups = get_iface_groups(iface_types, timelimit)
+
+    # eprint("iface groups: " + str(iface_groups))
+
+    if join_groups:
+        iface_groups = merge_interface_groups(iface_groups, join_groups)
+
+    dhcp_info    = extract_dhcp_info()
+
+    assigned_subnets = assign_discovered_subnets(dhcp_info, iface_groups)
+
+    # eprint("dhcp results: " + str(dhcp_info), indents=1)
+    # eprint("RAW GROUPS       > " + str(iface_groups))
+    # eprint("ASSIGNED: " + str(assigned_subnets), color='green')
+    # eprint("MANUAL SUBNETS   > " + str(manual_subnets))
+    # eprint("IFACE GROUPS     > " + str(iface_groups))
+
+    assign_manual_subnets(assigned_subnets, manual_subnets)
+
+    # eprint("ASSIGNED: " + str(assigned_subnets), color='green')
+
+    assign_dynamic_subnets(assigned_subnets, manual_subnets, subnet_pool, default_subnet_size)
+
+    # eprint("ASSIGNED: " + str(assigned_subnets), color='green')
+
+    eprint("done finding and assigning subnets", color='green')
+
+    return assigned_subnets
+
+def valid_cidr(string):
+    try:
+        ipaddress.ip_network(string)
+        return string
+    except ValueError:
+        msg = "%r is not a valid CIDR block" % string
+        raise argparse.ArgumentTypeError(msg)
+
+def valid_pair(string):
+    parts = string.split()
+    if len(parts) != 2:
+        msg = "%r is not a valid interface-subnet pair" % string
+        raise argparse.ArgumentTypeError(msg)
+    iface, cidr = parts
+
+    # Check if cidr is a valid IP network
+    try:
+        ipaddress.ip_network(cidr)
+        return iface, cidr
+    except ValueError:
+        pass
+
+    # Check if cidr is a valid digit between 32 and 0
+    try:
+        cidr_value = int(cidr)
+        if 0 <= cidr_value <= 32:
+            return iface, cidr
+        else:
+            msg = "%r in the pair is not a valid CIDR block or digit" % cidr
+            raise argparse.ArgumentTypeError(msg)
+    except ValueError:
+        pass
+
+    msg = "%r in the pair is not a valid CIDR block or digit" % cidr
+    raise argparse.ArgumentTypeError(msg)
+
+def main(args):
+
+    parser = argparse.ArgumentParser(description="Find and assign subnets")
+
+    parser.add_argument('-i', '--interfaces', nargs='+', required=True,
+                        choices=['eth', 'wlan', 'bridge', 'vlan', 'bond', 'tap', 'dummy', 'ppp', 'ipip',
+                                 'ib', 'ibchild', 
+                                 'ip6tnl', 'lo', 'sit', 'gre', 'irda', 'wlan_aux', 'tun', 'isdn', 'mip6mnha'],
+                        help="Network interfaces")
+    parser.add_argument('-t', '--timeout', type=int, required=True, help="Timeout period")
+    parser.add_argument('-s', '--subnets', nargs='+', required=True, type=valid_cidr, help="Subnet pools in CIDR format")
+    parser.add_argument('-m', '--manual', nargs='+', type=valid_pair, help="Manually assigned interface-subnet pairs")
+    parser.add_argument('-d', '--subnetsize', type=int, default=24, help="Default size for dynamically generated subnets")
+    parser.add_argument('-j', '--join', nargs='+', type=str, help="Specify interfaces to be assumed on the same L2 network")
+
+    # TODO (later - important ones are done)
+    # define a default subnet size associated with an interface: -d 'eth0 21' 'eth5 16'
+    # exclude interfaces and their interface groups: -X 'eth0 eth4'
+    # exclude interfaces but not their interface groups: -x 'eth2 eth3'
+    # only use these interfaces, and their interface groups: -O 'eth1 eth8'
+    # only use these interfaces, not even others in their iface group: -o 'eth2 eth4'
+
+    args = parser.parse_args(args)
+
+    check_root()
+
+    results = find_and_assign_subnets(args.interfaces, args.timeout, args.subnets, args.manual, args.subnetsize, args.join)
+
+    for result in results:
+        print('ifaces: ' + str(' '.join(result[0])) + ' status: ' + str(result[2]) + ' subnet: ' + str(result[1]))
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

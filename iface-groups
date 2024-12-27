@@ -1,0 +1,271 @@
+#!/bin/bash
+# written by me on October 1, 2022.
+
+# enumerates the properties of each network interface
+# eventually, it may be possible to assign rules on a per-network basis
+# i.e., all ifaces on 10.111.13/24 should request DHCP
+# unless, that's better done as a set of logic outside this program
+
+# we need to know:
+# - which interfaces are wired (compatible with PXE boots)
+# - which interfaces are connected
+# - which interfaces are on the same L2 network
+
+# ASSUMPTION: one interface is NOT connected to multiple L2 switches
+
+set -e
+
+sudo -v
+
+help () {
+
+    echo -e "usage:"
+    echo -e "\t-i , --ifacetype=[TYPE]"
+    echo -e "\t-t , --timelimit=[seconds]"
+    echo -e "Multiple interface types may be specified, like so:"
+    echo -e "\tiface-groups -i eth -i tun -t 5"
+    echo -e "Available interface types (at least one must be specified):"
+    echo -e "\teth, wlan, bridge, vlan, bond, tap, dummy, ib, ibchild, ppp,"
+    echo -e "\tipip, ip6tnl, lo, sit, gre, irda, wlan_aux, tun, isdn, mip6mnha"
+
+}
+
+eecho () { echo "$@" 1>&2 ; }
+
+# timelimit="$1" ; [ -z "$timelimit" ] && timelimit='4'
+
+ip_address_prefix='203.0.113'
+
+#         +----------------------+----------------------------+
+#         | Attribute            | Value                      |
+#         +----------------------+----------------------------+
+#         | Address Block        | 203.0.113.0/24             |
+#         | Name                 | Documentation (TEST-NET-3) |
+#         | RFC                  | [RFC5737]                  |
+#         | Allocation Date      | January 2010               |
+#         | Termination Date     | N/A                        |
+#         | Source               | False                      |
+#         | Destination          | False                      |
+#         | Forwardable          | False                      |
+#         | Global               | False                      |
+#         | Reserved-by-Protocol | False                      |
+#         +----------------------+----------------------------+
+# 
+#         Table 14: TEST-NET-3
+
+ifacetype=eth timelimit=3 lopts=ifacetype:,timelimit: sopts=i:t:
+
+PARSED=$(getopt --options=$sopts --longoptions=$lopts --name "$0" -- "$@")
+
+eval set -- "$PARSED"
+
+while true; do case "$1" in
+
+    -i|--ifacetype) 
+
+        allowed_iface_types="${allowed_iface_types:+$allowed_iface_types } $2"
+        shift 2
+        ;;
+
+    -t|--timelimit) 
+    
+        timelimit="$2"
+        shift 2
+        ;;
+
+    --) shift ; break ;;
+    *)  help ; exit 1 ;;
+
+esac done
+
+[ -z "$allowed_iface_types" ] && help && exit 1
+
+tempfile=/tmp/ifacegroups
+groupingfolder=/tmp/ifacegrouping
+
+rm -rf $tempfile $groupingfolder
+mkdir -p $tempfile
+mkdir -p $groupingfolder
+
+if ! command -v tcpdump &>/dev/null ; then echo "tcpdump required" ; exit 2 ; fi
+
+get_iface_type () {
+    
+    # function came from a dead link via stackoverflow
+    # http://gitorious.org/opensuse/sysconfig/blobs/master/scripts/functions
+    # https://github.com/openSUSE/sysconfig/blob/master/scripts/functions
+    # (GPL v2)
+    # (may want to rewrite this in TCL or lisp)
+
+    local IF=$1 TYPE
+    test -n "$IF" || return 1
+    test -d /sys/class/net/$IF || return 2
+    case "`cat /sys/class/net/$IF/type`" in
+            1)
+                TYPE=eth
+                # Ethernet, may also be wireless, ...
+                if test -d /sys/class/net/$IF/wireless -o \
+                        -L /sys/class/net/$IF/phy80211 ; then
+                    TYPE=wlan
+                elif test -d /sys/class/net/$IF/bridge ; then
+                    TYPE=bridge
+                elif test -f /proc/net/vlan/$IF ; then
+                    TYPE=vlan
+                elif test -d /sys/class/net/$IF/bonding ; then
+                    TYPE=bond
+                elif test -f /sys/class/net/$IF/tun_flags ; then
+                    TYPE=tap
+                elif test -d /sys/devices/virtual/net/$IF ; then
+                    case $IF in
+                      (dummy*) TYPE=dummy ;;
+                    esac
+                fi
+                ;;
+           24)  TYPE=eth ;; # firewire ;; # IEEE 1394 IPv4 - RFC 2734
+           32)  # InfiniBand
+            if test -d /sys/class/net/$IF/bonding ; then
+                TYPE=bond
+            elif test -d /sys/class/net/$IF/create_child ; then
+                TYPE=ib
+            else
+                TYPE=ibchild
+            fi
+                ;;
+          512)  TYPE=ppp ;;
+          768)  TYPE=ipip ;; # IPIP tunnel
+          769)  TYPE=ip6tnl ;; # IP6IP6 tunnel
+          772)  TYPE=lo ;;
+          776)  TYPE=sit ;; # sit0 device - IPv6-in-IPv4
+          778)  TYPE=gre ;; # GRE over IP
+          783)  TYPE=irda ;; # Linux-IrDA
+          801)  TYPE=wlan_aux ;;
+        65534)  TYPE=tun ;;
+    esac
+    # The following case statement still has to be replaced by something
+    # which does not rely on the interface names.
+    case $IF in
+        ippp*|isdn*) TYPE=isdn;;
+        mip6mnha*)   TYPE=mip6mnha;;
+    esac
+    test -n "$TYPE" && echo $TYPE && return 0
+    return 3
+}
+
+eecho "analysing available physical L2 networks..."
+
+# for every interface on the system
+for interface in /sys/class/net/*
+do
+
+    interface=$(basename $interface)
+
+    # figure out what it is: wifi? ethernet? virtual bridge? infiniband?
+    iface_type=$(get_iface_type $interface)
+
+    # for each of the useful interface types, specified above (or in an arg)
+    for allowed_iface_type in ${allowed_iface_types[@]}
+    do
+
+        # if the interface we're looking at is one of those allowed
+        if [ "$iface_type" == "$allowed_iface_type" ]
+        then
+
+            # if the interface is connected to something: switch, router, etc
+            if tcpdump --list-interfaces | grep $interface | grep -q 'Running'
+            then
+
+                # add it do the list of viable interfaces
+                viable_ifaces="${viable_ifaces:+$viable_ifaces } $interface"
+
+                eecho "found relevant iface: $interface"
+
+            fi
+
+            # don't check more types after a match: "there can be only one"
+            break
+
+        fi
+
+    done
+
+done
+
+[ -z "${viable_ifaces[@]}" ] && echo '' && exit 1
+
+ip_iterator=0
+
+declare -A iface_ip
+
+starttime=$(date +%s)
+
+# eecho "broadcasting and sniffing ARP on all ifaces for $timelimit seconds..."
+
+# for each viable interface we found
+for interface in ${viable_ifaces[@]}
+do
+
+    ip_iterator=$((ip_iterator+1))
+
+    # create a unique, unused ip address (taken from TEST-NET-3, RFC 6890)
+    ip_address="$ip_address_prefix.$ip_iterator"
+
+    # associate that ip address with the current interface
+    iface_ip+=(["$ip_address"]="$interface")
+
+    eecho "$interface broadcasting ARP with $ip_address and dumping results to $tempfile/$interface"
+
+    # start listening on that interface for ARP requests
+    sudo timeout $timelimit tcpdump --immediate-mode -i $interface arp > $tempfile/$interface 2>/dev/null &
+
+    # start sending ARP requests for the unique IP address on that interface
+    sudo arping -I $interface -w $timelimit $ip_address &>/dev/null &
+
+done
+
+# total time it took to start the listeners and senders
+endtime=$(date +%s)
+initializationtime=$(( $endtime - $starttime ))
+
+# wait for the listeners and senders to finish
+sleep $(($timelimit + $initializationtime + 1))
+
+# for each viable interface, get the file with the results from the listener
+for ifacefile in $tempfile/*
+do
+
+    ifacename=$(basename $ifacefile)
+
+    # if the iface is not already in a group of ifaces that can see each other
+    if ! grep -q $ifacename $groupingfolder/* 2>/dev/null
+    then
+
+        # create a new group with just that interface
+        echo $ifacename > $groupingfolder/$(date +%s%N)
+
+    fi
+
+    # for each ARP request seen by this interface, get the IP address requested
+    grep $ip_address_prefix $ifacefile | cut -d ' ' -f 5 | while read ipaddress
+    do
+
+        # get the group file of the interface that saw the request
+        groupfile=$(grep -l $ifacename $groupingfolder/* 2>/dev/null)
+
+        # convert the ip address to the sender interface and add it to the group
+        echo ${iface_ip[$ipaddress]} >> $groupfile
+
+    done
+
+done
+
+eecho "scan results:"
+
+# for each group of interfaces that we collected
+for group in $groupingfolder/*
+do 
+
+    # filter out duplicate interfaces within the group and print to stdout 
+    echo $(sort $group | uniq | xargs)
+
+done
+
